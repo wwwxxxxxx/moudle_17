@@ -1,0 +1,215 @@
+/***************************************************************************
+ *   Copyright (C) 2020 - 2023 by Federico Amedeo Izzo IU2NUO,             *
+ *                                Niccolò Izzo IU2KIN                      *
+ *                                Frederik Saraci IU2NRO                   *
+ *                                Silvano Seva IU2KWO                      *
+ *                                                                         *
+ *   This program is free software; you can redistribute it and/or modify  *
+ *   it under the terms of the GNU General Public License as published by  *
+ *   the Free Software Foundation; either version 3 of the License, or     *
+ *   (at your option) any later version.                                   *
+ *                                                                         *
+ *   This program is distributed in the hope that it will be useful,       *
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
+ *   GNU General Public License for more details.                          *
+ *                                                                         *
+ *   You should have received a copy of the GNU General Public License     *
+ *   along with this program; if not, see <http://www.gnu.org/licenses/>   *
+ ***************************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/errno.h>
+#include <posix_file.h>
+#include <nvmem_access.h>
+#include <interfaces/nvmem.h>
+
+#define NVM_MAX_PATHLEN 256
+
+POSIX_FILE_DEVICE_DEFINE(stateDevice, NULL, 1024)
+
+const struct nvmPartition statePartitions[] =
+{
+    {
+        .offset = 0x0000,   // First partition, radio state
+        .size   = 512
+    },
+    {
+        .offset = 0x0200,   // Second partition, settings
+        .size   = 512
+    }
+};
+
+const struct nvmArea areas[] =
+{
+    {
+        .name       = "Device state NVM area",
+        .dev        = &stateDevice,
+        .startAddr  = 0x0000,
+        .size       = 1024,
+        .partitions = statePartitions
+    }
+};
+
+
+/**
+ * Creates a directory if it does not exist.
+ *
+ * \param path: the directory path
+ * \return 0 on success, -1 on failure
+ */
+static int create_dir(const char *path)
+{
+    struct stat sb;
+
+    if(stat(path, &sb) == 0)
+    {
+        if(S_ISDIR(sb.st_mode))
+            return 0;
+
+        printf("%s is not a directory\n", path);
+    }
+    else if(errno == ENOENT)
+    {
+        if(mkdir(path, 0700) == 0)
+            return 0;
+
+        printf("Cannot create %s. %s\n", path, strerror(errno));
+    }
+    else
+    {
+        printf("Cannot stat %s. %s", path, strerror(errno));
+    }
+
+    return -1;
+}
+
+
+void nvm_init()
+{
+    const char *env_state_path = getenv("XDG_STATE_HOME");
+    const char *openrtx        = "/OpenRTX/";
+
+    char memory_path[NVM_MAX_PATHLEN];
+
+    if(env_state_path)
+    {
+         if(create_dir(env_state_path) != 0)
+             exit(1);
+
+         // we append /OpenRTX to env_state_path
+         if(strlen(env_state_path) + strlen(openrtx) >= NVM_MAX_PATHLEN)
+             goto toolong;
+
+         strcpy(memory_path, env_state_path);
+         strcat(memory_path, openrtx);
+    }
+    else
+    {
+        // XDG_STATE_HOME should default to ~/.local/state
+        // we build the path directory by directory making sure each one exists
+
+        const char *home = getenv("HOME");
+        const char *local = "/.local";
+        const char *state = "/state";
+
+        if(strlen(home) + strlen(local) + strlen(state) + strlen(openrtx)
+           >= NVM_MAX_PATHLEN)
+            goto toolong;
+
+        strcpy(memory_path, home);
+        strcat(memory_path, local);
+        if(create_dir(memory_path) != 0)
+            exit(1);
+
+        strcat(memory_path, state);
+        if(create_dir(memory_path) != 0)
+            exit(1);
+
+        strcat(memory_path, openrtx);
+    }
+
+    if(create_dir(memory_path) != 0)
+        exit(1);
+
+    strcat(memory_path, "state.bin");
+
+    int ret = posixFile_init(&stateDevice, memory_path);
+    if(ret < 0)
+        printf("Opening of state file failed with status %d\n", ret);
+
+    return;
+
+toolong:
+    printf("Expected path was too long\n");
+    exit(1);
+}
+
+void nvm_terminate()
+{
+    posixFile_terminate(&stateDevice);
+}
+
+size_t nvm_getMemoryAreas(const struct nvmArea **list)
+{
+    *list = &areas[0];
+
+    return (sizeof(areas) / sizeof(struct nvmArea));
+}
+
+void nvm_readHwInfo(hwInfo_t *info)
+{
+    /* Linux devices does not have any hardware info in the external flash. */
+    (void) info;
+}
+
+int nvm_readVfoChannelData(channel_t *channel)
+{
+    int ret = nvmArea_readPartition(&areas[0], 0, 0, channel, sizeof(channel_t));
+    if(ret < 0)
+        return ret;
+
+    // TODO: implement a more serious integrity check
+    for(size_t i = 0; i < sizeof(channel_t); i++)
+    {
+        const uint8_t *p = (const uint8_t *) channel;
+        if(p[i] != 0x00)
+            return 0;
+    }
+
+    return -1;
+}
+
+int nvm_readSettings(settings_t *settings)
+{
+    int ret = nvmArea_readPartition(&areas[0], 1, 0, settings, sizeof(settings_t));
+    if(ret < 0)
+        return ret;
+
+    // TODO: implement a more serious integrity check
+    for(size_t i = 0; i < sizeof(settings_t); i++)
+    {
+        const uint8_t *p = (const uint8_t *) settings;
+        if(p[i] != 0x00)
+            return 0;
+    }
+
+    return -1;
+}
+
+int nvm_writeSettings(const settings_t *settings)
+{
+    return nvmArea_writePartition(&areas[0], 1, 0, settings, sizeof(settings_t));
+}
+
+int nvm_writeSettingsAndVfo(const settings_t *settings, const channel_t *vfo)
+{
+    int ret = nvmArea_writePartition(&areas[0], 1, 0, settings, sizeof(settings_t));
+    if(ret < 0)
+        return ret;
+
+    return nvmArea_writePartition(&areas[0], 0, 0, vfo, sizeof(channel_t));
+}
